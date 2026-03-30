@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file: ./backend/.env
+    volumes:
+      - ./backend:/app
+      - backend-cache:/app/.cache
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    env_file: ./frontend/.env.local
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    command: npm run dev
+    depends_on:
+      - backend
+    environment:
+      - BACKEND_URL=http://backend:8000
+    restart: unless-stopped
+
+volumes:
+  backend-cache:

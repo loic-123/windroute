@@ -1,0 +1,35 @@
+# Framework
+fastapi>=0.115
+uvicorn[standard]>=0.32
+pydantic>=2.9
+pydantic-settings>=2.6
+
+# Calcul
+osmnx>=2.0
+networkx>=3.4
+scipy>=1.14
+numpy>=2.1
+
+# Geo + GPX
+gpxpy>=1.6
+geopy>=2.4
+shapely>=2.0
+
+# Elevation
+elevation>=1.1
+
+# API clients
+httpx>=0.28
+supabase>=2.10
+
+# Output
+geojson>=3.1
+
+# Config
+python-dotenv>=1.0
+rich>=13.9
+
+# Dev + test
+pytest>=8.3
+pytest-asyncio>=0.24
+ruff>=0.8

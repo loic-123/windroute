@@ -1,0 +1,38 @@
+{
+  "id": "test-event-001",
+  "name": "5x5min @ 105% FTP",
+  "description": "Intervalles seuil avec recuperation active",
+  "category": "WORKOUT",
+  "type": "Ride",
+  "start_date": "2026-03-30",
+  "workout_doc": {
+    "steps": [
+      {
+        "type": "WARMUP",
+        "duration": 900,
+        "power": {"value": 55, "units": "%ftp"}
+      },
+      {
+        "type": "REPEAT",
+        "count": 5,
+        "steps": [
+          {
+            "type": "INTERVAL",
+            "duration": 300,
+            "power": {"value": 105, "units": "%ftp"}
+          },
+          {
+            "type": "RECOVERY",
+            "duration": 180,
+            "power": {"value": 50, "units": "%ftp"}
+          }
+        ]
+      },
+      {
+        "type": "COOLDOWN",
+        "duration": 600,
+        "power": {"value": 50, "units": "%ftp"}
+      }
+    ]
+  }
+}
