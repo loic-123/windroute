@@ -56,10 +56,23 @@ export function RouteElevation({ coords, onHover }: RouteElevationProps) {
 
   const fullData = buildElevationData(coords);
 
-  // Subsample for display
+  // Subsample at regular DISTANCE intervals (not index intervals)
+  // so the cursor moves at constant speed on the map
   const maxPoints = 500;
-  const step = Math.max(1, Math.floor(fullData.length / maxPoints));
-  const sampled = fullData.filter((_, i) => i % step === 0);
+  const totalDist = fullData[fullData.length - 1].distance;
+  const distStep = totalDist / maxPoints;
+  const sampled: ElevationPoint[] = [fullData[0]];
+  let nextDist = distStep;
+  for (let i = 1; i < fullData.length; i++) {
+    if (fullData[i].distance >= nextDist) {
+      sampled.push(fullData[i]);
+      nextDist += distStep;
+    }
+  }
+  // Always include last point
+  if (sampled[sampled.length - 1] !== fullData[fullData.length - 1]) {
+    sampled.push(fullData[fullData.length - 1]);
+  }
 
   const handleMouseMove = (state: any) => {
     if (!onHover || !state?.activePayload?.[0]?.payload) return;
