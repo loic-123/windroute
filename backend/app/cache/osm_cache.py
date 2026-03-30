@@ -111,12 +111,11 @@ def load_or_fetch_graph(
 
 
 def enrich_elevations(graph: nx.MultiDiGraph) -> nx.MultiDiGraph:
-    """Add elevation data to graph nodes using OSMnx built-in method.
+    """Add elevation data to graph nodes.
 
-    Uses the open-elevation API or Google Elevation API via OSMnx.
+    Tries open-elevation API via httpx, then falls back to setting
+    elevation=0 for all nodes (flat terrain approximation).
     """
-    import osmnx as ox
-
     # Check how many nodes already have elevation
     nodes_with_ele = sum(
         1 for _, d in graph.nodes(data=True) if "elevation" in d
@@ -125,26 +124,66 @@ def enrich_elevations(graph: nx.MultiDiGraph) -> nx.MultiDiGraph:
 
     if nodes_with_ele >= total * 0.9:
         logger.info("Graph already has elevation data (%d/%d nodes)", nodes_with_ele, total)
-        return graph
+        return _add_edge_grades(graph)
 
     logger.info("Enriching %d nodes with elevation data...", total - nodes_with_ele)
 
     try:
-        graph = ox.elevation.add_node_elevations_google(graph, api_key=None)
-    except Exception:
+        graph = _fetch_elevations_open(graph)
+    except Exception as e:
+        logger.warning(
+            "Failed to fetch elevations: %s. Using flat terrain (elevation=0).", e
+        )
+        for node in graph.nodes:
+            if "elevation" not in graph.nodes[node]:
+                graph.nodes[node]["elevation"] = 0.0
+
+    return _add_edge_grades(graph)
+
+
+def _fetch_elevations_open(graph: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    """Fetch elevations from open-elevation.com API in batches."""
+    import httpx
+
+    nodes_need = [
+        (n, d["y"], d["x"])
+        for n, d in graph.nodes(data=True)
+        if "elevation" not in d
+    ]
+
+    batch_size = 200
+    for i in range(0, len(nodes_need), batch_size):
+        batch = nodes_need[i : i + batch_size]
+        locations = [{"latitude": lat, "longitude": lon} for _, lat, lon in batch]
+
         try:
-            graph = ox.elevation.add_node_elevations_open(graph)
-        except Exception as e:
-            logger.warning(
-                "Failed to fetch elevations: %s. "
-                "Elevation-dependent features may be inaccurate.",
-                e,
+            resp = httpx.post(
+                "https://api.open-elevation.com/api/v1/lookup",
+                json={"locations": locations},
+                timeout=30.0,
             )
+            resp.raise_for_status()
+            results = resp.json().get("results", [])
+            for (node_id, _, _), result in zip(batch, results):
+                graph.nodes[node_id]["elevation"] = result.get("elevation", 0.0)
+        except Exception as e:
+            logger.warning("Open-elevation batch %d failed: %s", i, e)
+            for node_id, _, _ in batch:
+                graph.nodes[node_id]["elevation"] = 0.0
 
-    # Add edge grades
-    try:
-        graph = ox.elevation.add_edge_grades(graph)
-    except Exception:
-        pass
+    return graph
 
+
+def _add_edge_grades(graph: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    """Compute grade for each edge from node elevations."""
+    for u, v, key, data in graph.edges(keys=True, data=True):
+        ele_u = graph.nodes[u].get("elevation", 0)
+        ele_v = graph.nodes[v].get("elevation", 0)
+        length = data.get("length", 0)
+        if length > 0:
+            data["grade"] = (ele_v - ele_u) / length
+            data["grade_abs"] = abs(data["grade"])
+        else:
+            data["grade"] = 0.0
+            data["grade_abs"] = 0.0
     return graph

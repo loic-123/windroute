@@ -3,8 +3,8 @@ from pydantic import BaseModel
 
 class AthleteProfileResponse(BaseModel):
     id: str = ""
-    intervals_athlete_id: str = ""
-    name: str = ""
+    intervals_athlete_id: str | None = ""
+    name: str | None = ""
     weight_kg: float = 75.0
     ftp_watts: int = 250
     cda: float = 0.36

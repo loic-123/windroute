@@ -9,6 +9,7 @@ osmnx>=2.0
 networkx>=3.4
 scipy>=1.14
 numpy>=2.1
+scikit-learn>=1.5
 
 # Geo + GPX
 gpxpy>=1.6

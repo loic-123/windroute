@@ -6,7 +6,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api-client";
 import { WindCompass } from "@/components/weather/wind-compass";
 import { WorkoutBlocks } from "@/components/workout/workout-blocks";
-import { Loader2, Play, CheckCircle, XCircle } from "lucide-react";
+import { Loader2, Play, CheckCircle, XCircle, LocateFixed } from "lucide-react";
 import type { GenerateRequest } from "@/types/api";
 
 export default function GeneratePageWrapper() {
@@ -37,6 +37,17 @@ function GeneratePage() {
   const [climbMode, setClimbMode] = useState("auto");
   const [maxRadius, setMaxRadius] = useState(40);
   const [jobId, setJobId] = useState<string | null>(null);
+
+  const geolocate = () => {
+    navigator.geolocation?.getCurrentPosition(
+      (pos) => {
+        setLat(+pos.coords.latitude.toFixed(6));
+        setLon(+pos.coords.longitude.toFixed(6));
+      },
+      () => {},
+      { enableHighAccuracy: true }
+    );
+  };
 
   useEffect(() => {
     if (profile?.home_lat && profile?.home_lon) {
@@ -100,7 +111,17 @@ function GeneratePage() {
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {/* Parameters */}
         <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 space-y-4">
-          <h2 className="font-medium text-gray-300">Parametres</h2>
+          <div className="flex items-center justify-between">
+            <h2 className="font-medium text-gray-300">Parametres</h2>
+            <button
+              type="button"
+              onClick={geolocate}
+              className="flex items-center gap-1 px-3 py-1 bg-blue-600 hover:bg-blue-700 rounded text-xs font-medium"
+            >
+              <LocateFixed size={14} />
+              Ma position
+            </button>
+          </div>
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-sm text-gray-400 mb-1">Latitude</label>

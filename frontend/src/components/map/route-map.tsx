@@ -1,9 +1,8 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import dynamic from "next/dynamic";
 
-// Leaflet must be dynamically imported (no SSR)
 const MapContainer = dynamic(
   () => import("react-leaflet").then((m) => m.MapContainer),
   { ssr: false }
@@ -16,12 +15,8 @@ const GeoJSON = dynamic(
   () => import("react-leaflet").then((m) => m.GeoJSON),
   { ssr: false }
 );
-const Popup = dynamic(
-  () => import("react-leaflet").then((m) => m.Popup),
-  { ssr: false }
-);
-const Marker = dynamic(
-  () => import("react-leaflet").then((m) => m.Marker),
+const CircleMarker = dynamic(
+  () => import("react-leaflet").then((m) => m.CircleMarker),
   { ssr: false }
 );
 
@@ -30,13 +25,15 @@ interface RouteMapProps {
   center?: [number, number];
   zoom?: number;
   height?: string;
+  hoverPoint?: { lat: number; lon: number } | null;
 }
 
 export function RouteMap({
   geojson,
   center = [48.1173, -1.6778],
-  zoom = 12,
+  zoom = 13,
   height = "500px",
+  hoverPoint,
 }: RouteMapProps) {
   const [mounted, setMounted] = useState(false);
 
@@ -55,17 +52,19 @@ export function RouteMap({
     );
   }
 
+  const computedCenter = geojson ? _computeCenter(geojson) : center;
+
   return (
-    <div style={{ height }} className="rounded-lg overflow-hidden">
+    <div style={{ height }} className="rounded-lg overflow-hidden border border-gray-700">
       <MapContainer
-        center={center}
+        center={computedCenter}
         zoom={zoom}
         style={{ height: "100%", width: "100%" }}
         scrollWheelZoom
       >
         <TileLayer
-          attribution='&copy; <a href="https://www.openstreetmap.org">OSM</a>'
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          attribution='&copy; <a href="https://www.openstreetmap.org">OSM</a> &copy; <a href="https://carto.com">CARTO</a>'
+          url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
         />
 
         {geojson && (
@@ -75,10 +74,13 @@ export function RouteMap({
             style={(feature) => {
               if (feature?.geometry.type === "Point") return {};
               const props = feature?.properties || {};
+              const isInterval = props.block_type === "interval";
               return {
                 color: props.color || "#6b7280",
-                weight: props.block_type === "interval" ? 5 : 3,
-                opacity: 0.9,
+                weight: isInterval ? 6 : 4,
+                opacity: 1,
+                lineCap: "round",
+                lineJoin: "round",
               };
             }}
             onEachFeature={(feature, layer) => {
@@ -86,37 +88,73 @@ export function RouteMap({
               if (feature.geometry.type === "LineString") {
                 const label =
                   props.block_type === "interval"
-                    ? `Intervalle: ${props.power_target}W | ${props.distance_km} km`
-                    : `${props.block_type}: ${props.distance_km} km | ${props.duration_min} min`;
+                    ? `<b>Intervalle</b><br/>${props.power_target}W | ${props.distance_km} km | ${props.duration_min} min`
+                    : `<b>${_blockLabel(props.block_type)}</b><br/>${props.distance_km} km | ${props.duration_min} min | ${props.avg_speed_kmh} km/h`;
                 layer.bindPopup(label);
-              } else if (props.marker_type) {
-                layer.bindPopup(
-                  `${props.label}${
-                    props.power_target ? ` | ${props.power_target}W` : ""
-                  }${
-                    props.avg_grade ? ` | ${props.avg_grade}%` : ""
-                  }`
-                );
+              } else if (props.marker_type === "start") {
+                layer.bindPopup(`<b>${props.label}</b>`);
+              } else if (props.marker_type === "finish") {
+                layer.bindPopup(`<b>${props.label}</b>`);
               }
             }}
             pointToLayer={(feature, latlng) => {
-              // Use dynamic import for L
               const L = require("leaflet");
               const props = feature.properties;
-              const isClimb = props.marker_type === "climb_start";
-              const isStart = props.marker_type === "interval_start";
+              const isStart = props.marker_type === "start";
 
               return L.circleMarker(latlng, {
-                radius: isClimb ? 8 : 6,
-                fillColor: isClimb ? "#f59e0b" : isStart ? "#ef4444" : "#22c55e",
-                color: "#fff",
-                weight: 2,
-                fillOpacity: 0.9,
+                radius: 10,
+                fillColor: isStart ? "#22c55e" : "#3b82f6",
+                color: "#ffffff",
+                weight: 3,
+                fillOpacity: 1,
               });
+            }}
+          />
+        )}
+
+        {/* Cursor that follows elevation profile hover */}
+        {hoverPoint && (
+          <CircleMarker
+            center={[hoverPoint.lat, hoverPoint.lon]}
+            radius={8}
+            pathOptions={{
+              fillColor: "#facc15",
+              color: "#ffffff",
+              weight: 3,
+              fillOpacity: 1,
             }}
           />
         )}
       </MapContainer>
     </div>
   );
+}
+
+function _computeCenter(geojson: GeoJSON.FeatureCollection): [number, number] {
+  const lines = geojson.features.filter(
+    (f) => f.geometry.type === "LineString"
+  );
+  if (lines.length === 0) return [48.1173, -1.6778];
+
+  let sumLat = 0, sumLon = 0, count = 0;
+  for (const feat of lines) {
+    const coords = (feat.geometry as GeoJSON.LineString).coordinates;
+    for (const c of coords) {
+      sumLon += c[0];
+      sumLat += c[1];
+      count++;
+    }
+  }
+  return [sumLat / count, sumLon / count];
+}
+
+function _blockLabel(type: string): string {
+  const labels: Record<string, string> = {
+    warmup: "Echauffement",
+    interval: "Intervalle",
+    recovery: "Recuperation",
+    cooldown: "Retour au calme",
+  };
+  return labels[type] || type;
 }

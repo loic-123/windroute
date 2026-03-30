@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { api } from "@/lib/api-client";
 import { RouteMap } from "@/components/map/route-map";
@@ -19,6 +20,10 @@ export default function RouteDetailPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = use(params);
+  const [hoverPoint, setHoverPoint] = useState<{
+    lat: number;
+    lon: number;
+  } | null>(null);
 
   const { data: route, isLoading } = useQuery({
     queryKey: ["route", id],
@@ -32,13 +37,26 @@ export default function RouteDetailPage({
   if (isLoading) return <p className="text-gray-400">Chargement...</p>;
   if (!route) return <p className="text-red-400">Route non trouvee</p>;
 
-  const center: [number, number] = route.geojson?.features?.[0]?.geometry?.type === "LineString"
-    ? (() => {
-        const coords = (route.geojson!.features[0].geometry as GeoJSON.LineString).coordinates;
-        const mid = coords[Math.floor(coords.length / 2)];
-        return [mid[1], mid[0]] as [number, number];
-      })()
-    : [48.1173, -1.6778];
+  const center: [number, number] =
+    route.geojson?.features?.[0]?.geometry?.type === "LineString"
+      ? (() => {
+          const coords = (
+            route.geojson!.features[0].geometry as GeoJSON.LineString
+          ).coordinates;
+          const mid = coords[Math.floor(coords.length / 2)];
+          return [mid[1], mid[0]] as [number, number];
+        })()
+      : [48.1173, -1.6778];
+
+  // Extract all coords from LineString features for elevation profile
+  const elevationCoords =
+    route.geojson?.features
+      ?.filter((f) => f.geometry.type === "LineString")
+      .flatMap((f) =>
+        (f.geometry as GeoJSON.LineString).coordinates.map(
+          (c) => [c[1], c[0], c[2] || 0] as [number, number, number]
+        )
+      ) || null;
 
   return (
     <div className="space-y-6">
@@ -77,7 +95,10 @@ export default function RouteDetailPage({
       {route.warnings.length > 0 && (
         <div className="bg-yellow-900/30 border border-yellow-800 rounded-lg p-4 space-y-1">
           {route.warnings.map((w, i) => (
-            <div key={i} className="flex items-center gap-2 text-yellow-400 text-sm">
+            <div
+              key={i}
+              className="flex items-center gap-2 text-yellow-400 text-sm"
+            >
               <AlertTriangle size={14} />
               {w}
             </div>
@@ -85,25 +106,19 @@ export default function RouteDetailPage({
         </div>
       )}
 
-      {/* Map */}
-      <RouteMap geojson={route.geojson} center={center} />
+      {/* Map with hover cursor */}
+      <RouteMap
+        geojson={route.geojson}
+        center={center}
+        hoverPoint={hoverPoint}
+      />
 
-      {/* Elevation profile */}
+      {/* Elevation profile — hover syncs with map */}
       <div className="bg-gray-900 border border-gray-800 rounded-lg p-5">
         <h2 className="text-sm font-medium text-gray-400 mb-3">
           Profil d&apos;elevation
         </h2>
-        <RouteElevation
-          coords={
-            route.geojson?.features
-              ?.filter((f) => f.geometry.type === "LineString")
-              .flatMap((f) =>
-                (f.geometry as GeoJSON.LineString).coordinates.map(
-                  (c) => [c[1], c[0], c[2] || 0] as [number, number, number]
-                )
-              ) || null
-          }
-        />
+        <RouteElevation coords={elevationCoords} onHover={setHoverPoint} />
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -149,7 +164,9 @@ export default function RouteDetailPage({
               ))}
             </div>
           ) : (
-            <p className="text-gray-500 text-sm">Pas de montees (seance endurance)</p>
+            <p className="text-gray-500 text-sm">
+              Pas de montees (seance endurance)
+            </p>
           )}
         </div>
       </div>
@@ -162,14 +179,30 @@ export default function RouteDetailPage({
           </h2>
           <div className="flex gap-4 text-sm text-gray-300">
             <span>
-              Vent: {(route.weather_snapshot as Record<string, number>).wind_speed_kmh?.toFixed(0)} km/h{" "}
-              {(route.weather_snapshot as Record<string, string>).wind_direction_label}
+              Vent:{" "}
+              {(
+                route.weather_snapshot as Record<string, number>
+              ).wind_speed_kmh?.toFixed(0)}{" "}
+              km/h{" "}
+              {
+                (route.weather_snapshot as Record<string, string>)
+                  .wind_direction_label
+              }
             </span>
             <span>
-              Temp: {(route.weather_snapshot as Record<string, number>).temperature_c?.toFixed(1)}°C
+              Temp:{" "}
+              {(
+                route.weather_snapshot as Record<string, number>
+              ).temperature_c?.toFixed(1)}
+              °C
             </span>
             <span>
-              Nuages: {(route.weather_snapshot as Record<string, number>).cloudcover_percent}%
+              Nuages:{" "}
+              {
+                (route.weather_snapshot as Record<string, number>)
+                  .cloudcover_percent
+              }
+              %
             </span>
           </div>
         </div>

@@ -1,13 +1,12 @@
 """
 GeoJSON generator: produces map data for the frontend.
 
-Replaces Folium HTML generation — the frontend renders the map
-with react-leaflet using this GeoJSON data.
+Only includes LineString segments (colored by block type) and
+start/finish markers. No individual interval markers to avoid clutter.
 """
 
 from app.models.route import Route
 
-# Colors by block type
 BLOCK_COLORS = {
     "warmup": "#22c55e",      # green
     "interval": "#ef4444",    # red
@@ -20,8 +19,10 @@ BLOCK_COLORS = {
 def route_to_geojson(route: Route) -> dict:
     """Convert a Route to a GeoJSON FeatureCollection.
 
-    Each segment becomes a Feature with properties for styling
-    and interactivity (block type, power target, color, etc.)
+    Includes:
+        - LineString per segment (colored by block type)
+        - Start marker (first coord)
+        - Finish marker (last coord)
     """
     features = []
 
@@ -29,7 +30,6 @@ def route_to_geojson(route: Route) -> dict:
         if not seg.coords or len(seg.coords) < 2:
             continue
 
-        # GeoJSON uses [lon, lat, elevation]
         coordinates = [[lon, lat, ele] for lat, lon, ele in seg.coords]
 
         feature = {
@@ -50,65 +50,42 @@ def route_to_geojson(route: Route) -> dict:
             },
         }
 
-        # Add climb info if present
         if seg.climb:
             feature["properties"]["climb"] = {
                 "length_m": round(seg.climb.length_m, 0),
                 "avg_grade": round(seg.climb.avg_grade_percent, 1),
                 "max_grade": round(seg.climb.max_grade_percent, 1),
                 "elevation_gain_m": round(seg.climb.elevation_gain_m, 0),
-                "quality_score": round(seg.climb.quality_score, 3),
             }
 
         features.append(feature)
 
-    # Add markers for interval starts/ends
-    for seg in route.segments:
-        if seg.block_type == "interval" and seg.coords:
-            start = seg.coords[0]
-            features.append({
-                "type": "Feature",
-                "geometry": {
-                    "type": "Point",
-                    "coordinates": [start[1], start[0], start[2]],
-                },
-                "properties": {
-                    "marker_type": "interval_start",
-                    "block_index": seg.block_index,
-                    "power_target": round(seg.power_target, 0),
-                    "label": f"INT {seg.block_index} START",
-                },
-            })
-
-            end = seg.coords[-1]
-            features.append({
-                "type": "Feature",
-                "geometry": {
-                    "type": "Point",
-                    "coordinates": [end[1], end[0], end[2]],
-                },
-                "properties": {
-                    "marker_type": "interval_end",
-                    "block_index": seg.block_index,
-                    "label": f"INT {seg.block_index} END",
-                },
-            })
-
-    # Add climb markers
-    for i, climb in enumerate(route.climbs):
+    # Start marker
+    if route.coords:
+        start = route.coords[0]
         features.append({
             "type": "Feature",
             "geometry": {
                 "type": "Point",
-                "coordinates": [climb.start_lon, climb.start_lat],
+                "coordinates": [start[1], start[0], start[2]],
             },
             "properties": {
-                "marker_type": "climb_start",
-                "climb_index": i,
-                "label": f"Climb {i + 1}",
-                "length_m": round(climb.length_m, 0),
-                "avg_grade": round(climb.avg_grade_percent, 1),
-                "elevation_gain_m": round(climb.elevation_gain_m, 0),
+                "marker_type": "start",
+                "label": "Depart",
+            },
+        })
+
+        # Finish marker (same as start for a loop)
+        end = route.coords[-1]
+        features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [end[1], end[0], end[2]],
+            },
+            "properties": {
+                "marker_type": "finish",
+                "label": "Arrivee",
             },
         })
 

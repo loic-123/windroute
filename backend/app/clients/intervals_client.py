@@ -43,11 +43,25 @@ class IntervalsClient:
         resp.raise_for_status()
         data = resp.json()
 
+        # Weight is in icu_weight, not weight
+        weight = data.get("icu_weight") or data.get("weight") or 75.0
+
+        # FTP is in sportSettings[0].ftp for cycling
+        ftp = 250
+        sport_settings = data.get("sportSettings", [])
+        for ss in sport_settings:
+            types = ss.get("types", [])
+            if any(t in types for t in ["Ride", "VirtualRide", "Cycling"]):
+                ftp = ss.get("ftp", 250) or 250
+                break
+
+        name = data.get("name") or data.get("firstname", "")
+
         return AthleteProfile(
             intervals_athlete_id=self.athlete_id,
-            name=data.get("name", ""),
-            weight_kg=data.get("weight", 75.0),
-            ftp_watts=data.get("ftp", 250),
+            name=name,
+            weight_kg=float(weight),
+            ftp_watts=int(ftp),
         )
 
     # ── Workouts ─────────────────────────────────────────────────
@@ -84,7 +98,9 @@ class IntervalsClient:
             e
             for e in events
             if e.get("category") == "WORKOUT"
-            and e.get("type", "").lower() in ("ride", "cycling", "virtualride")
+            and e.get("type", "").lower() in (
+                "ride", "cycling", "virtualride", "mountainbikeride", "gravelride", "trackride"
+            )
             and e.get("workout_doc")
         ]
 
@@ -119,12 +135,10 @@ class IntervalsClient:
         blocks: list[WorkoutBlock] = []
 
         for step in steps:
-            step_type = step.get("type", "").upper()
-
-            if step_type == "REPEAT" or "steps" in step:
-                # Nested repeat group: unfold N times
-                repeat_count = step.get("count", step.get("repeat", 1))
-                inner_steps = step.get("steps", [])
+            # Repeat block: has "reps" or "steps" with nested children
+            if "steps" in step:
+                repeat_count = step.get("reps", step.get("count", step.get("repeat", 1)))
+                inner_steps = step["steps"]
                 for rep in range(repeat_count):
                     blocks.extend(
                         self._flatten_steps(inner_steps, ftp, repeat_idx=rep)
@@ -150,13 +164,21 @@ class IntervalsClient:
         block_type = self._classify_step_type(step)
         power_watts, power_pct = self._resolve_power(step, ftp)
 
+        # Parse cadence from dict format {"units": "rpm", "value": 85}
+        cadence = step.get("cadence")
+        cadence_target = None
+        if isinstance(cadence, dict):
+            cadence_target = cadence.get("value")
+        elif isinstance(cadence, (int, float)):
+            cadence_target = int(cadence)
+
         return WorkoutBlock(
             index=0,  # will be re-indexed later
             block_type=block_type,
             duration_seconds=duration,
             power_watts=power_watts,
             power_percent_ftp=power_pct,
-            cadence_target=step.get("cadence"),
+            cadence_target=cadence_target,
             repeat_index=repeat_idx,
         )
 
@@ -168,17 +190,24 @@ class IntervalsClient:
             return int(step["seconds"])
         if "minutes" in step:
             return int(step["minutes"] * 60)
-        # Distance-based steps: estimate from distance and power
-        # (will be refined later with physics engine)
         if "distance" in step:
-            # Rough estimate: 30 km/h = ~120m per second on flat
             return max(int(step["distance"] / 8.33), 60)
         return 0
 
     def _classify_step_type(self, step: dict) -> BlockType:
-        """Map intervals.icu step type to our BlockType enum."""
-        raw = step.get("type", "").upper()
+        """Map intervals.icu step to our BlockType.
 
+        Intervals.icu uses boolean flags (warmup, cooldown) on steps
+        rather than a type field. Text hints also help classify.
+        """
+        # Boolean flags (intervals.icu native format)
+        if step.get("warmup"):
+            return BlockType.WARMUP
+        if step.get("cooldown"):
+            return BlockType.COOLDOWN
+
+        # Check type field if present
+        raw = step.get("type", "").upper()
         mapping = {
             "WARMUP": BlockType.WARMUP,
             "WARM_UP": BlockType.WARMUP,
@@ -192,61 +221,80 @@ class IntervalsClient:
             "STEADY_STATE": BlockType.INTERVAL,
             "RAMP": BlockType.INTERVAL,
         }
-        return mapping.get(raw, BlockType.INTERVAL)
+        if raw in mapping:
+            return mapping[raw]
+
+        # Heuristic from text
+        text = (step.get("text") or "").lower()
+        if "recovery" in text or "recup" in text:
+            return BlockType.RECOVERY
+        if "warm" in text:
+            return BlockType.WARMUP
+        if "cool" in text:
+            return BlockType.COOLDOWN
+
+        # Heuristic from power level
+        power = step.get("power")
+        if isinstance(power, dict):
+            pct = power.get("value") or power.get("end") or 0
+            if power.get("units") in ("%ftp", "% ftp") and pct <= 55:
+                return BlockType.RECOVERY
+
+        return BlockType.INTERVAL
 
     def _resolve_power(
         self, step: dict, ftp: int
     ) -> tuple[float, float | None]:
-        """Resolve power to absolute watts. Returns (watts, percent_ftp_or_none)."""
-        # Direct watts
-        if "power" in step and isinstance(step["power"], (int, float)):
-            watts = float(step["power"])
-            return watts, watts / ftp * 100 if ftp > 0 else None
+        """Resolve power to absolute watts. Returns (watts, percent_ftp_or_none).
 
-        # Percentage of FTP
-        for key in ("power", "powerLow", "powerHigh"):
-            val = step.get(key)
-            if isinstance(val, dict):
-                # intervals.icu format: {"value": 105, "units": "%ftp"}
-                if val.get("units") in ("%ftp", "% ftp"):
-                    pct = val["value"]
-                    return ftp * pct / 100, pct
+        Handles intervals.icu formats:
+          - {"units": "%ftp", "value": 65}         fixed target
+          - {"units": "%ftp", "start": 45, "end": 75}  ramp/range
+          - {"units": "power_zone", "value": 2}    zone reference
+        """
+        power = step.get("power")
 
-        # Range: use midpoint
-        low = step.get("powerLow")
-        high = step.get("powerHigh")
-        if low is not None and high is not None:
-            if isinstance(low, (int, float)) and isinstance(high, (int, float)):
-                mid = (low + high) / 2
-                return mid, mid / ftp * 100 if ftp > 0 else None
+        if power is None:
+            # Running workout or no power target — default to endurance
+            pace = step.get("pace")
+            if pace:
+                logger.debug("Step uses pace, not power — defaulting to 60%% FTP")
+            return ftp * 0.60, 60.0
 
-        # Percentage as plain number (0-2 range = fraction of FTP)
-        for key in ("power", "intensity"):
-            val = step.get(key)
-            if isinstance(val, (int, float)):
-                if 0 < val <= 2.0:
-                    # Likely a fraction of FTP
-                    pct = val * 100
-                    return ftp * val, pct
-                elif val > 2:
-                    # Likely absolute watts
-                    return float(val), val / ftp * 100 if ftp > 0 else None
+        # Direct watts (unlikely but handle)
+        if isinstance(power, (int, float)):
+            return float(power), power / ftp * 100 if ftp > 0 else None
 
-        # RPE fallback: conservative estimate
-        rpe = step.get("rpe")
-        if rpe is not None:
-            return self._rpe_to_watts(rpe, ftp), None
+        # Dict format
+        if isinstance(power, dict):
+            units = power.get("units", "")
 
-        # Default: endurance zone (60% FTP)
-        logger.warning("No power target found in step, defaulting to 60%% FTP")
+            if units in ("%ftp", "% ftp", "%FTP"):
+                # Fixed value or ramp (start/end)
+                if "value" in power:
+                    pct = float(power["value"])
+                elif "start" in power and "end" in power:
+                    # Use midpoint for ramps
+                    pct = (float(power["start"]) + float(power["end"])) / 2
+                elif "start" in power:
+                    pct = float(power["start"])
+                elif "end" in power:
+                    pct = float(power["end"])
+                else:
+                    pct = 60.0
+                return ftp * pct / 100, pct
+
+            elif units == "power_zone":
+                # Map zone number to approximate %FTP
+                zone_pct = {1: 50, 2: 60, 3: 75, 4: 90, 5: 105, 6: 120, 7: 140}
+                zone = int(power.get("value", 2))
+                pct = zone_pct.get(zone, 60)
+                return ftp * pct / 100, float(pct)
+
+            elif units in ("watts", "W", "w"):
+                watts = float(power.get("value", power.get("start", 0)))
+                return watts, watts / ftp * 100 if ftp > 0 else None
+
+        # Fallback
+        logger.warning("Unrecognized power format: %s — defaulting to 60%% FTP", power)
         return ftp * 0.60, 60.0
-
-    @staticmethod
-    def _rpe_to_watts(rpe: float, ftp: int) -> float:
-        """Conservative RPE → watts mapping based on standard zones."""
-        rpe_to_pct = {
-            1: 0.45, 2: 0.50, 3: 0.55, 4: 0.60, 5: 0.70,
-            6: 0.80, 7: 0.90, 8: 0.95, 9: 1.05, 10: 1.15,
-        }
-        pct = rpe_to_pct.get(int(min(max(rpe, 1), 10)), 0.60)
-        return ftp * pct
