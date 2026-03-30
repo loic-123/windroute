@@ -1,13 +1,14 @@
 """
-Route generator: builds complete cycling routes from workout + terrain + weather.
+Route generator: builds clean out-and-back cycling routes.
 
-Generates 3 route variants:
-    A: maximize wind optimization
-    B: maximize climb quality
-    C: balanced compromise (weighted by config)
+Strategy:
+    1. Calculate total ride distance from workout blocks + speeds
+    2. Find a turnaround point at half-distance in the headwind direction
+    3. Route: home → turnaround (headwind) → home (tailwind)
+    4. Map workout blocks sequentially onto the route by distance
+    5. Generate 3 variants with slightly different turnaround targets
 
-CRITICAL INVARIANT: The route is always continuous. Each segment starts
-exactly where the previous one ended. No teleportation.
+The route is always a clean out-and-back. No spaghetti.
 """
 
 import logging
@@ -19,15 +20,9 @@ import osmnx as ox
 
 from app.cache.osm_cache import enrich_elevations, load_or_fetch_graph
 from app.config import settings
-from app.engine.climb_finder import detect_climbs, select_climbs_for_workout
 from app.engine.physics import estimate_speed_flat, power_to_speed
 from app.engine.sunshine_scorer import score_sunshine
-from app.engine.timing import (
-    compute_block_distances,
-    compute_cooldown_reach_km,
-    compute_elastic_max,
-    compute_warmup_reach_km,
-)
+from app.engine.timing import compute_block_distances
 from app.engine.wind_optimizer import (
     bearing_penalty,
     compute_edge_bearing,
@@ -56,362 +51,175 @@ class GenerationParams:
 
 
 async def generate_routes(params: GenerationParams) -> list[Route]:
-    """Generate 3 route variants for a workout."""
+    """Generate up to 3 clean out-and-back route variants."""
     workout = params.workout
     athlete = params.athlete
     forecast = params.forecast
     weather = forecast.current
 
-    # ── Step 1: Estimate speeds and distances ────────────────────
+    # ── Step 1: Estimate speeds and total distance ───────────────
     blocks = workout.blocks
     speeds = _estimate_block_speeds(blocks, athlete, weather)
-    block_distances = compute_block_distances(blocks, speeds)
-
-    total_distance_m = sum(bd["distance_m"] for bd in block_distances)
-    warmup_reach_km = compute_warmup_reach_km(blocks, speeds)
-
-    # ── Step 2: Calculate search radius ──────────────────────────
-    radius_m = min(
-        total_distance_m / (2 * math.pi) * 1.2,
-        params.max_radius_km * 1000,
-    )
-    radius_m = max(radius_m, 3000)
+    block_dists = compute_block_distances(blocks, speeds)
+    total_distance_m = sum(bd["distance_m"] for bd in block_dists)
+    half_distance_m = total_distance_m / 2
 
     logger.info(
-        "Estimated total distance: %.1f km, search radius: %.1f km",
+        "Total estimated distance: %.1f km (half: %.1f km)",
         total_distance_m / 1000,
-        radius_m / 1000,
+        half_distance_m / 1000,
     )
 
-    # ── Step 3: Load graph and enrich elevations ─────────────────
+    # ── Step 2: Load graph ───────────────────────────────────────
+    radius_m = min(half_distance_m * 1.1, params.max_radius_km * 1000)
+    radius_m = max(radius_m, 3000)
+
+    logger.info("Loading OSM graph with radius %.1f km", radius_m / 1000)
+
     graph = load_or_fetch_graph(
         params.lat, params.lon, radius_m, network_type="bike"
     )
+
+    logger.info("Graph loaded: %d nodes, %d edges", len(graph.nodes), len(graph.edges))
+
+    # Enrich with SRTM elevation data (local files, instant)
     graph = enrich_elevations(graph)
 
-    # ── Step 4: Find start node ──────────────────────────────────
     start_node = ox.nearest_nodes(graph, params.lon, params.lat)
 
-    # ── Step 5: Detect and select climbs ─────────────────────────
-    selected_climbs = []
-    climb_mode_used = params.climb_mode
-
-    if workout.has_intervals:
-        climbs = detect_climbs(graph)
-        if climbs:
-            selected_climbs, climb_mode_used = select_climbs_for_workout(
-                climbs=climbs,
-                interval_blocks=workout.interval_blocks,
-                athlete=athlete,
-                climb_mode=params.climb_mode,
-                wind_speed_ms=weather.wind_speed_ms,
-                temp_c=weather.temperature_c,
-            )
-
-    # ── Step 6: Wind bearings ────────────────────────────────────
+    # ── Step 3: Wind bearings ────────────────────────────────────
     wind_dir = weather.wind_direction_deg
     outbound_bearing = preferred_outbound_bearing(wind_dir)
     return_bearing = preferred_return_bearing(wind_dir)
 
-    # ── Step 7: Generate 3 variants ──────────────────────────────
-    weight_sets = _get_weight_sets(params.weights)
-    variants = []
+    # ── Step 4: Generate 3 variants with different targets ───────
+    # A: strict headwind bearing
+    # B: 30° clockwise from headwind
+    # C: 30° counter-clockwise from headwind
+    variant_bearings = {
+        "A": outbound_bearing,
+        "B": (outbound_bearing + 30) % 360,
+        "C": (outbound_bearing - 30) % 360,
+    }
 
-    for variant_name, weights in weight_sets.items():
+    variants = []
+    for variant_name, bearing in variant_bearings.items():
         try:
-            route = _build_single_route(
+            route = _build_out_and_back(
                 graph=graph,
                 start_node=start_node,
+                half_distance_m=half_distance_m,
+                outbound_bearing=bearing,
+                return_bearing=(bearing + 180) % 360,
                 blocks=blocks,
                 speeds=speeds,
+                block_dists=block_dists,
                 athlete=athlete,
                 forecast=forecast,
-                selected_climbs=selected_climbs,
-                climb_mode=climb_mode_used,
-                outbound_bearing=outbound_bearing,
-                return_bearing=return_bearing,
                 variant=variant_name,
-                weights=weights,
-                warmup_reach_km=warmup_reach_km,
+                wind_dir=wind_dir,
             )
             variants.append(route)
         except Exception as e:
             logger.error("Failed to generate variant %s: %s", variant_name, e)
-            continue
 
     variants.sort(key=lambda r: r.overall_score, reverse=True)
     return variants
 
 
-def _estimate_block_speeds(
-    blocks: list[WorkoutBlock],
-    athlete: AthleteProfile,
-    weather,
-) -> list[float]:
-    speeds = []
-    for block in blocks:
-        speed = estimate_speed_flat(
-            power_w=block.power_watts,
-            cda=athlete.get_cda(),
-            weight_kg=athlete.weight_kg,
-            bike_weight_kg=athlete.bike_weight_kg,
-            crr=athlete.crr,
-            temp_c=weather.temperature_c,
-        )
-        speeds.append(speed)
-    return speeds
-
-
-def _get_weight_sets(custom_weights: dict | None = None) -> dict[str, dict]:
-    return {
-        "A": {"wind": 0.60, "climb": 0.25, "sunshine": 0.10, "heatmap": 0.05},
-        "B": {"wind": 0.15, "climb": 0.60, "sunshine": 0.15, "heatmap": 0.10},
-        "C": custom_weights or {
-            "wind": settings.wind_weight,
-            "climb": settings.climb_weight,
-            "sunshine": settings.sunshine_weight,
-            "heatmap": settings.heatmap_weight,
-        },
-    }
-
-
-def _build_single_route(
+def _build_out_and_back(
     graph: nx.MultiDiGraph,
     start_node: int,
-    blocks: list[WorkoutBlock],
-    speeds: list[float],
-    athlete: AthleteProfile,
-    forecast: WeatherForecast,
-    selected_climbs: list[ClimbCandidate],
-    climb_mode: str,
+    half_distance_m: float,
     outbound_bearing: float,
     return_bearing: float,
+    blocks: list[WorkoutBlock],
+    speeds: list[float],
+    block_dists: list[dict],
+    athlete: AthleteProfile,
+    forecast: WeatherForecast,
     variant: str,
-    weights: dict,
-    warmup_reach_km: float,
+    wind_dir: float,
 ) -> Route:
-    """Build a single route variant.
+    """Build a clean out-and-back route.
 
-    INVARIANT: `current_node` tracks where the cyclist is at all times.
-    Every path starts from `current_node` and updates it to the path's end.
+    1. Find turnaround node at ~half_distance in outbound_bearing direction
+    2. Route home → turnaround with bearing-weighted shortest path
+    3. Route turnaround → home (different path if possible)
+    4. Map blocks onto the combined path by cumulative distance
     """
-    weather = forecast.current
+
+    # ── Find turnaround point ────────────────────────────────────
+    turnaround_node = _find_turnaround(
+        graph, start_node, outbound_bearing, half_distance_m
+    )
+
+    if turnaround_node is None or turnaround_node == start_node:
+        raise ValueError("Cannot find turnaround point")
+
+    # ── Build outbound path (headwind) ───────────────────────────
+    _set_bearing_weights(graph, outbound_bearing, wind_weight=0.5)
+    outbound_path = _shortest_path(graph, start_node, turnaround_node, "_bw")
+    _clear_weights(graph)
+
+    if outbound_path is None:
+        raise ValueError("No outbound path found")
+
+    out_nodes, out_dist = outbound_path
+
+    # ── Build return path (tailwind) ─────────────────────────────
+    # Try to find a DIFFERENT return path by penalizing outbound edges
+    _set_bearing_weights(graph, return_bearing, wind_weight=0.5)
+    _penalize_used_edges(graph, out_nodes, penalty_factor=3.0)
+    return_path = _shortest_path(graph, turnaround_node, start_node, "_bw")
+    _clear_weights(graph)
+
+    if return_path is None:
+        # Fallback: same path reversed
+        return_path = (list(reversed(out_nodes)), out_dist)
+
+    ret_nodes, ret_dist = return_path
+
+    # ── Combine into one continuous path ─────────────────────────
+    all_nodes = list(out_nodes) + list(ret_nodes[1:])  # skip duplicate turnaround
+    all_coords = _nodes_to_coords(graph, all_nodes)
+
+    # Compute cumulative distances along the path
+    edge_dists = _compute_edge_distances(graph, all_nodes)
+    total_route_dist = sum(edge_dists)
+
+    # ── Map blocks onto the path by distance ─────────────────────
+    segments = _map_blocks_to_path(
+        blocks, speeds, block_dists, all_nodes, all_coords,
+        edge_dists, total_route_dist, graph
+    )
+
+    # ── Build Route object ───────────────────────────────────────
     route = Route(variant=variant)
-    warnings = []
-
-    all_nodes = [start_node]
-    all_coords = [_node_to_coord(graph, start_node)]
-    segments = []
-    current_node = start_node
-
-    warmup_blocks = [b for b in blocks if b.block_type == BlockType.WARMUP]
-    warmup_duration = sum(b.duration_seconds for b in warmup_blocks) if warmup_blocks else settings.warmup_min_duration_s
-
-    # ── Phase 1: Outbound (warmup) ───────────────────────────────
-
-    if selected_climbs:
-        target_node = selected_climbs[0].start_node
-
-        path = _find_path(graph, current_node, target_node, outbound_bearing, weights["wind"])
-        if path:
-            path_nodes, path_dist = path
-            warmup_speed = speeds[0] if speeds else 7.0
-            actual_duration = path_dist / warmup_speed
-
-            warmup_max = compute_elastic_max(warmup_duration)
-            if actual_duration > warmup_max:
-                warnings.append(
-                    f"Montée à {path_dist/1000:.1f} km, "
-                    f"budget échauffement max = {warmup_reach_km:.1f} km"
-                )
-
-            route.warmup_duration_initial_s = warmup_duration
-            route.warmup_duration_actual_s = int(actual_duration)
-            route.warmup_distance_km = path_dist / 1000
-
-            current_node = _append_path(graph, path_nodes, all_nodes, all_coords)
-            segments.append(RouteSegment(
-                block_index=0,
-                block_type="warmup",
-                nodes=path_nodes,
-                coords=_nodes_to_coords(graph, path_nodes),
-                distance_m=path_dist,
-                duration_s=actual_duration,
-                power_target=warmup_blocks[0].power_watts if warmup_blocks else 0,
-                avg_speed_ms=warmup_speed,
-            ))
-    else:
-        # No climbs: outbound loop
-        far_node = _find_far_node(graph, start_node, outbound_bearing, warmup_reach_km * 500)
-        if far_node and far_node != start_node:
-            path = _find_path(graph, current_node, far_node, outbound_bearing, weights["wind"])
-            if path:
-                path_nodes, path_dist = path
-                current_node = _append_path(graph, path_nodes, all_nodes, all_coords)
-                segments.append(RouteSegment(
-                    block_index=0,
-                    block_type="warmup",
-                    nodes=path_nodes,
-                    coords=_nodes_to_coords(graph, path_nodes),
-                    distance_m=path_dist,
-                    duration_s=path_dist / (speeds[0] if speeds else 7.0),
-                    power_target=warmup_blocks[0].power_watts if warmup_blocks else 0,
-                ))
-
-    # ── Phase 2: Climb segments (intervals) ──────────────────────
-
-    if selected_climbs and workout_has_intervals(blocks):
-        interval_blocks = [b for b in blocks if b.is_effort]
-
-        if climb_mode == "repeat":
-            climb = selected_climbs[0]
-            for i, block in enumerate(interval_blocks):
-                # Route to climb start if not already there
-                if current_node != climb.start_node:
-                    transfer = _find_path(graph, current_node, climb.start_node)
-                    if transfer:
-                        t_nodes, t_dist = transfer
-                        current_node = _append_path(graph, t_nodes, all_nodes, all_coords)
-
-                # Ascent
-                climb_path = _find_path(graph, current_node, climb.end_node)
-                if climb_path:
-                    c_nodes, c_dist = climb_path
-                    c_speed = power_to_speed(
-                        block.power_watts, climb.avg_grade_percent,
-                        0.0, athlete.get_cda(), athlete.weight_kg,
-                        athlete.bike_weight_kg, athlete.crr,
-                        weather.temperature_c,
-                    )
-                    current_node = _append_path(graph, c_nodes, all_nodes, all_coords)
-                    segments.append(RouteSegment(
-                        block_index=block.index,
-                        block_type="interval",
-                        nodes=c_nodes,
-                        coords=_nodes_to_coords(graph, c_nodes),
-                        distance_m=c_dist,
-                        duration_s=c_dist / c_speed if c_speed > 0 else block.duration_seconds,
-                        power_target=block.power_watts,
-                        avg_speed_ms=c_speed,
-                        avg_grade_percent=climb.avg_grade_percent,
-                        climb=climb,
-                    ))
-
-                # Descent (recovery between repeats, except after last)
-                if i < len(interval_blocks) - 1:
-                    desc_path = _find_path(graph, current_node, climb.start_node)
-                    if desc_path:
-                        d_nodes, d_dist = desc_path
-                        d_speed = power_to_speed(
-                            athlete.ftp_watts * 0.5, -climb.avg_grade_percent,
-                            0.0, athlete.get_cda("drops"), athlete.weight_kg,
-                            athlete.bike_weight_kg, athlete.crr,
-                            weather.temperature_c,
-                        )
-                        current_node = _append_path(graph, d_nodes, all_nodes, all_coords)
-                        segments.append(RouteSegment(
-                            block_index=block.index,
-                            block_type="recovery",
-                            nodes=d_nodes,
-                            coords=_nodes_to_coords(graph, d_nodes),
-                            distance_m=d_dist,
-                            duration_s=d_dist / d_speed if d_speed > 0 else 180,
-                            power_target=athlete.ftp_watts * 0.5,
-                            avg_speed_ms=d_speed,
-                            avg_grade_percent=-climb.avg_grade_percent,
-                        ))
-
-        elif climb_mode == "loop":
-            for i, (block, climb) in enumerate(zip(interval_blocks, selected_climbs)):
-                # Route to this climb's start
-                if current_node != climb.start_node:
-                    transfer = _find_path(graph, current_node, climb.start_node)
-                    if transfer:
-                        t_nodes, t_dist = transfer
-                        current_node = _append_path(graph, t_nodes, all_nodes, all_coords)
-                        segments.append(RouteSegment(
-                            block_index=block.index,
-                            block_type="recovery",
-                            nodes=t_nodes,
-                            coords=_nodes_to_coords(graph, t_nodes),
-                            distance_m=t_dist,
-                            duration_s=t_dist / (speeds[block.index] if block.index < len(speeds) else 7.0),
-                        ))
-
-                # Climb
-                climb_path = _find_path(graph, current_node, climb.end_node)
-                if climb_path:
-                    c_nodes, c_dist = climb_path
-                    c_speed = power_to_speed(
-                        block.power_watts, climb.avg_grade_percent,
-                        0.0, athlete.get_cda(), athlete.weight_kg,
-                        athlete.bike_weight_kg, athlete.crr,
-                        weather.temperature_c,
-                    )
-                    current_node = _append_path(graph, c_nodes, all_nodes, all_coords)
-                    segments.append(RouteSegment(
-                        block_index=block.index,
-                        block_type="interval",
-                        nodes=c_nodes,
-                        coords=_nodes_to_coords(graph, c_nodes),
-                        distance_m=c_dist,
-                        duration_s=c_dist / c_speed if c_speed > 0 else block.duration_seconds,
-                        power_target=block.power_watts,
-                        avg_speed_ms=c_speed,
-                        avg_grade_percent=climb.avg_grade_percent,
-                        climb=climb,
-                    ))
-
-    # ── Phase 3: Return (cooldown) ───────────────────────────────
-
-    if current_node != start_node:
-        return_path = _find_path(graph, current_node, start_node, return_bearing, weights["wind"])
-        if return_path:
-            r_nodes, r_dist = return_path
-            cooldown_blocks = [b for b in blocks if b.block_type == BlockType.COOLDOWN]
-            cooldown_duration = sum(b.duration_seconds for b in cooldown_blocks) if cooldown_blocks else settings.cooldown_min_duration_s
-            cooldown_speed = speeds[-1] if speeds else 7.0
-
-            route.cooldown_duration_initial_s = cooldown_duration
-            route.cooldown_duration_actual_s = int(r_dist / cooldown_speed)
-            route.cooldown_distance_km = r_dist / 1000
-
-            current_node = _append_path(graph, r_nodes, all_nodes, all_coords)
-            segments.append(RouteSegment(
-                block_index=len(blocks) - 1,
-                block_type="cooldown",
-                nodes=r_nodes,
-                coords=_nodes_to_coords(graph, r_nodes),
-                distance_m=r_dist,
-                duration_s=r_dist / cooldown_speed,
-                power_target=cooldown_blocks[0].power_watts if cooldown_blocks else 0,
-                avg_speed_ms=cooldown_speed,
-            ))
-
-    # ── Phase 4: Compute scores ──────────────────────────────────
-
     route.nodes = all_nodes
     route.coords = all_coords
     route.segments = segments
-    route.climbs = selected_climbs
-    route.warnings = warnings
-
-    route.total_distance_km = sum(s.distance_m for s in segments) / 1000
+    route.total_distance_km = total_route_dist / 1000
     route.total_elevation_m = _compute_total_elevation(all_coords)
     route.estimated_duration_s = int(sum(s.duration_s for s in segments))
+    route.warmup_distance_km = out_dist / 1000
+    route.cooldown_distance_km = ret_dist / 1000
 
-    route.wind_score = _compute_wind_score(segments, weather.wind_direction_deg)
-    route.climb_score = _compute_climb_score(selected_climbs, blocks)
-
+    # Scores
+    route.wind_score = _compute_wind_score(
+        all_coords, out_dist, total_route_dist, wind_dir, outbound_bearing
+    )
+    route.climb_score = 0.5  # neutral for out-and-back
     seg_hours = [sum(s.duration_s for s in segments[:i]) / 3600 for i in range(len(segments))]
     seg_durations = [s.duration_s for s in segments]
     route.sunshine_score = score_sunshine(forecast, seg_hours, seg_durations)
+    route.heatmap_score = 0.5
 
     route.overall_score = (
-        weights["wind"] * route.wind_score
-        + weights["climb"] * route.climb_score
-        + weights["sunshine"] * route.sunshine_score
-        + weights["heatmap"] * route.heatmap_score
+        0.35 * route.wind_score
+        + 0.25 * route.climb_score
+        + 0.25 * route.sunshine_score
+        + 0.15 * route.heatmap_score
     )
 
     if forecast.wind_shift_warning:
@@ -420,143 +228,210 @@ def _build_single_route(
     return route
 
 
-# ── Helper functions ─────────────────────────────────────────────
+# ── Path finding helpers ─────────────────────────────────────────
 
 
-def workout_has_intervals(blocks: list[WorkoutBlock]) -> bool:
-    return any(b.is_effort for b in blocks)
-
-
-def _node_to_coord(graph: nx.MultiDiGraph, node: int) -> tuple[float, float, float]:
-    d = graph.nodes[node]
-    return (d.get("y", 0.0), d.get("x", 0.0), d.get("elevation", 0.0))
-
-
-def _nodes_to_coords(
-    graph: nx.MultiDiGraph, nodes: list[int]
-) -> list[tuple[float, float, float]]:
-    return [_node_to_coord(graph, n) for n in nodes]
-
-
-def _append_path(
-    graph: nx.MultiDiGraph,
-    path_nodes: list[int],
-    all_nodes: list[int],
-    all_coords: list[tuple[float, float, float]],
-) -> int:
-    """Append path to the running node/coord lists, skipping the first node
-    (which is the same as the last node already in the list).
-
-    Returns the new current_node (last node of path).
-    """
-    if not path_nodes:
-        return all_nodes[-1] if all_nodes else 0
-
-    # Skip the first node — it's where we already are
-    new_nodes = path_nodes[1:] if len(path_nodes) > 1 else []
-    all_nodes.extend(new_nodes)
-    all_coords.extend(_nodes_to_coords(graph, new_nodes))
-
-    return path_nodes[-1]
-
-
-def _find_path(
-    graph: nx.MultiDiGraph,
-    source: int,
-    target: int,
-    preferred_bearing: float | None = None,
-    wind_weight: float = 0.0,
-) -> tuple[list[int], float] | None:
-    """Find a path from source to target.
-
-    If preferred_bearing is given, uses custom edge weights that penalize
-    deviation from the preferred direction. Falls back to shortest path.
-    """
-    if source == target:
-        return [source], 0.0
-
-    # Try bearing-weighted path first
-    if preferred_bearing is not None and wind_weight > 0:
-        result = _route_with_bearing_preference(
-            graph, source, target, preferred_bearing, wind_weight
-        )
-        if result:
-            return result
-
-    # Fallback: shortest path by distance
-    return _shortest_path_safe(graph, source, target)
-
-
-def _shortest_path_safe(
-    graph: nx.MultiDiGraph,
-    source: int,
-    target: int,
-) -> tuple[list[int], float] | None:
-    try:
-        path = ox.shortest_path(graph, source, target, weight="length")
-        if path is None:
-            return None
-        dist = sum(
-            graph.edges[path[i], path[i + 1], 0].get("length", 0)
-            for i in range(len(path) - 1)
-        )
-        return path, dist
-    except (nx.NetworkXNoPath, nx.NodeNotFound):
-        return None
-
-
-def _route_with_bearing_preference(
-    graph: nx.MultiDiGraph,
-    source: int,
-    target: int,
-    preferred_bearing: float,
-    wind_weight: float,
-) -> tuple[list[int], float] | None:
-    for u, v, key, data in graph.edges(keys=True, data=True):
-        length = data.get("length", 1.0)
-        u_data = graph.nodes[u]
-        v_data = graph.nodes[v]
-        edge_bearing = compute_edge_bearing(
-            u_data.get("y", 0), u_data.get("x", 0),
-            v_data.get("y", 0), v_data.get("x", 0),
-        )
-        penalty = bearing_penalty(edge_bearing, preferred_bearing)
-        data["_wind_weight"] = length * (1.0 + wind_weight * penalty)
-
-    try:
-        path = ox.shortest_path(graph, source, target, weight="_wind_weight")
-        if path is None:
-            return None
-        dist = sum(
-            graph.edges[path[i], path[i + 1], 0].get("length", 0)
-            for i in range(len(path) - 1)
-        )
-        return path, dist
-    except (nx.NetworkXNoPath, nx.NodeNotFound):
-        return None
-    finally:
-        for u, v, key, data in graph.edges(keys=True, data=True):
-            data.pop("_wind_weight", None)
-
-
-def _find_far_node(
+def _find_turnaround(
     graph: nx.MultiDiGraph,
     start_node: int,
     bearing: float,
     target_distance_m: float,
 ) -> int | None:
-    """Find a node roughly in the given direction at the given distance."""
+    """Find a turnaround node at ~target_distance in the given bearing.
+
+    Strategy: compute a target lat/lon, find nearest graph node,
+    then verify a path exists. If too far or no path, try closer.
+    """
     start_data = graph.nodes[start_node]
-    start_lat = start_data.get("y", 0)
-    start_lon = start_data.get("x", 0)
+    start_lat = start_data["y"]
+    start_lon = start_data["x"]
 
-    target_lat = start_lat + (target_distance_m / 111000) * math.cos(math.radians(bearing))
-    target_lon = start_lon + (target_distance_m / (111000 * math.cos(math.radians(start_lat)))) * math.sin(math.radians(bearing))
+    # Try distances from 100% down to 40% of target
+    for fraction in [1.0, 0.85, 0.7, 0.55, 0.4]:
+        dist = target_distance_m * fraction
+        target_lat = start_lat + (dist / 111000) * math.cos(math.radians(bearing))
+        target_lon = start_lon + (dist / (111000 * math.cos(math.radians(start_lat)))) * math.sin(math.radians(bearing))
 
+        try:
+            node = ox.nearest_nodes(graph, target_lon, target_lat)
+        except Exception:
+            continue
+
+        if node == start_node:
+            continue
+
+        # Verify path exists
+        path = _shortest_path(graph, start_node, node, "length")
+        if path is not None:
+            actual_dist = path[1]
+            logger.info(
+                "Turnaround found at %.1f km (target was %.1f km, fraction=%.0f%%)",
+                actual_dist / 1000,
+                target_distance_m / 1000,
+                fraction * 100,
+            )
+            return node
+
+    return None
+
+
+def _set_bearing_weights(
+    graph: nx.MultiDiGraph,
+    preferred_bearing: float,
+    wind_weight: float,
+) -> None:
+    """Set custom edge weights that penalize deviation from preferred bearing."""
+    for u, v, key, data in graph.edges(keys=True, data=True):
+        length = data.get("length", 1.0)
+        edge_bearing = compute_edge_bearing(
+            graph.nodes[u].get("y", 0), graph.nodes[u].get("x", 0),
+            graph.nodes[v].get("y", 0), graph.nodes[v].get("x", 0),
+        )
+        penalty = bearing_penalty(edge_bearing, preferred_bearing)
+        data["_bw"] = length * (1.0 + wind_weight * penalty)
+
+
+def _penalize_used_edges(
+    graph: nx.MultiDiGraph,
+    used_nodes: list[int],
+    penalty_factor: float = 3.0,
+) -> None:
+    """Make edges already used more expensive to encourage a different return."""
+    used_set = set(zip(used_nodes[:-1], used_nodes[1:]))
+    for u, v, key, data in graph.edges(keys=True, data=True):
+        if (u, v) in used_set or (v, u) in used_set:
+            data["_bw"] = data.get("_bw", data.get("length", 1.0)) * penalty_factor
+
+
+def _clear_weights(graph: nx.MultiDiGraph) -> None:
+    for u, v, key, data in graph.edges(keys=True, data=True):
+        data.pop("_bw", None)
+
+
+def _shortest_path(
+    graph: nx.MultiDiGraph,
+    source: int,
+    target: int,
+    weight: str = "length",
+) -> tuple[list[int], float] | None:
+    """Find shortest path, return (nodes, distance_m) or None."""
     try:
-        return ox.nearest_nodes(graph, target_lon, target_lat)
-    except Exception:
+        path = ox.shortest_path(graph, source, target, weight=weight)
+        if path is None:
+            return None
+        dist = sum(
+            graph.edges[path[i], path[i + 1], 0].get("length", 0)
+            for i in range(len(path) - 1)
+        )
+        return path, dist
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
         return None
+
+
+# ── Block mapping ────────────────────────────────────────────────
+
+
+def _map_blocks_to_path(
+    blocks: list[WorkoutBlock],
+    speeds: list[float],
+    block_dists: list[dict],
+    all_nodes: list[int],
+    all_coords: list[tuple[float, float, float]],
+    edge_dists: list[float],
+    total_route_dist: float,
+    graph: nx.MultiDiGraph,
+) -> list[RouteSegment]:
+    """Map workout blocks sequentially onto the route path.
+
+    Each block occupies a stretch of the route proportional to its
+    estimated distance. The coords/nodes are sliced accordingly.
+    """
+    # Build cumulative distance array for each node
+    cum_dist = [0.0]
+    for d in edge_dists:
+        cum_dist.append(cum_dist[-1] + d)
+
+    total_block_dist = sum(bd["distance_m"] for bd in block_dists)
+    if total_block_dist <= 0:
+        total_block_dist = total_route_dist
+
+    # Scale factor: route distance / planned distance
+    scale = total_route_dist / total_block_dist if total_block_dist > 0 else 1.0
+
+    segments = []
+    route_cursor = 0.0  # where we are along the route (meters)
+
+    for block, speed, bd in zip(blocks, speeds, block_dists):
+        block_dist_on_route = bd["distance_m"] * scale
+        seg_start = route_cursor
+        seg_end = min(route_cursor + block_dist_on_route, total_route_dist)
+
+        # Find node indices for this segment
+        start_idx = _dist_to_node_index(cum_dist, seg_start)
+        end_idx = _dist_to_node_index(cum_dist, seg_end)
+        end_idx = max(end_idx, start_idx + 1)  # at least 2 nodes
+
+        seg_nodes = all_nodes[start_idx : end_idx + 1]
+        seg_coords = all_coords[start_idx : end_idx + 1]
+        seg_distance = seg_end - seg_start
+
+        segments.append(RouteSegment(
+            block_index=block.index,
+            block_type=block.block_type.value,
+            nodes=seg_nodes,
+            coords=seg_coords,
+            distance_m=seg_distance,
+            duration_s=seg_distance / speed if speed > 0 else block.duration_seconds,
+            power_target=block.power_watts,
+            avg_speed_ms=speed,
+        ))
+
+        route_cursor = seg_end
+
+    return segments
+
+
+def _dist_to_node_index(cum_dist: list[float], target: float) -> int:
+    """Find the node index closest to a cumulative distance."""
+    for i, d in enumerate(cum_dist):
+        if d >= target:
+            return i
+    return len(cum_dist) - 1
+
+
+# ── Geometry helpers ─────────────────────────────────────────────
+
+
+def _nodes_to_coords(
+    graph: nx.MultiDiGraph, nodes: list[int]
+) -> list[tuple[float, float, float]]:
+    return [
+        (
+            graph.nodes[n].get("y", 0.0),
+            graph.nodes[n].get("x", 0.0),
+            graph.nodes[n].get("elevation", 0.0),
+        )
+        for n in nodes
+    ]
+
+
+def _compute_edge_distances(
+    graph: nx.MultiDiGraph, nodes: list[int]
+) -> list[float]:
+    """Compute actual edge lengths along a path."""
+    dists = []
+    for i in range(len(nodes) - 1):
+        try:
+            length = graph.edges[nodes[i], nodes[i + 1], 0].get("length", 0)
+        except KeyError:
+            # Edge not found, estimate from coords
+            c1 = graph.nodes[nodes[i]]
+            c2 = graph.nodes[nodes[i + 1]]
+            dlat = (c2["y"] - c1["y"]) * 111000
+            dlon = (c2["x"] - c1["x"]) * 111000 * math.cos(math.radians(c1["y"]))
+            length = math.sqrt(dlat ** 2 + dlon ** 2)
+        dists.append(length)
+    return dists
 
 
 def _compute_total_elevation(coords: list[tuple[float, float, float]]) -> float:
@@ -569,32 +444,42 @@ def _compute_total_elevation(coords: list[tuple[float, float, float]]) -> float:
 
 
 def _compute_wind_score(
-    segments: list[RouteSegment],
-    wind_direction: float,
+    coords: list[tuple[float, float, float]],
+    outbound_dist: float,
+    total_dist: float,
+    wind_dir: float,
+    outbound_bearing: float,
 ) -> float:
-    favorable_dist = 0.0
-    total_dist = 0.0
+    """Simple wind score: how well aligned is the route with wind?"""
+    if len(coords) < 2 or total_dist <= 0:
+        return 0.5
 
-    for seg in segments:
-        if seg.block_type == "interval":
-            continue
+    # Outbound bearing vs headwind
+    out_penalty = bearing_penalty(outbound_bearing, wind_dir)
+    # Return bearing vs tailwind direction
+    ret_bearing = (outbound_bearing + 180) % 360
+    ret_penalty = bearing_penalty(ret_bearing, (wind_dir + 180) % 360)
 
-        total_dist += seg.distance_m
-        if len(seg.coords) >= 2:
-            seg_bearing = compute_edge_bearing(
-                seg.coords[0][0], seg.coords[0][1],
-                seg.coords[-1][0], seg.coords[-1][1],
-            )
-            penalty = bearing_penalty(seg_bearing, wind_direction)
-            favorable_dist += seg.distance_m * (1 - penalty)
+    # Weight by distance proportion
+    out_frac = outbound_dist / total_dist
+    ret_frac = 1.0 - out_frac
 
-    return favorable_dist / total_dist if total_dist > 0 else 0.5
+    return 1.0 - (out_penalty * out_frac + ret_penalty * ret_frac)
 
 
-def _compute_climb_score(
-    climbs: list[ClimbCandidate],
+def _estimate_block_speeds(
     blocks: list[WorkoutBlock],
-) -> float:
-    if not climbs:
-        return 1.0 if not any(b.is_effort for b in blocks) else 0.0
-    return sum(c.quality_score for c in climbs) / len(climbs)
+    athlete: AthleteProfile,
+    weather,
+) -> list[float]:
+    return [
+        estimate_speed_flat(
+            power_w=b.power_watts,
+            cda=athlete.get_cda(),
+            weight_kg=athlete.weight_kg,
+            bike_weight_kg=athlete.bike_weight_kg,
+            crr=athlete.crr,
+            temp_c=weather.temperature_c,
+        )
+        for b in blocks
+    ]

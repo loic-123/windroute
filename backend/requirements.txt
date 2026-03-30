@@ -17,7 +17,7 @@ geopy>=2.4
 shapely>=2.0
 
 # Elevation
-elevation>=1.1
+srtm.py>=0.3
 
 # API clients
 httpx>=0.28

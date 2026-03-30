@@ -36,6 +36,7 @@ function GeneratePage() {
   const [lon, setLon] = useState(-1.6778);
   const [climbMode, setClimbMode] = useState("auto");
   const [maxRadius, setMaxRadius] = useState(40);
+  const [durationMin, setDurationMin] = useState(90);
   const [jobId, setJobId] = useState<string | null>(null);
 
   const geolocate = () => {
@@ -86,6 +87,7 @@ function GeneratePage() {
       options: {
         climb_mode: climbMode,
         max_radius_km: maxRadius,
+        duration_seconds: workoutId ? undefined : durationMin * 60,
       },
     };
     generateMutation.mutate(request);
@@ -100,11 +102,36 @@ function GeneratePage() {
     <div className="max-w-3xl space-y-6">
       <h1 className="text-2xl font-bold">Generer une route</h1>
 
-      {/* Workout preview */}
-      {workout && (
+      {/* Workout preview or duration selector */}
+      {workout ? (
         <div className="bg-gray-900 border border-gray-800 rounded-lg p-5">
           <h2 className="font-medium mb-2">{workout.name}</h2>
           <WorkoutBlocks blocks={workout.blocks} />
+        </div>
+      ) : (
+        <div className="bg-gray-900 border border-gray-800 rounded-lg p-5 space-y-3">
+          <h2 className="font-medium text-gray-300">Sortie libre (endurance)</h2>
+          <p className="text-sm text-gray-400">Aucune seance selectionnee — sortie endurance a 65% FTP</p>
+          <div>
+            <label className="block text-sm text-gray-400 mb-1">
+              Duree: {Math.floor(durationMin / 60)}h{(durationMin % 60).toString().padStart(2, "0")}
+            </label>
+            <input
+              type="range"
+              min={30}
+              max={300}
+              step={15}
+              value={durationMin}
+              onChange={(e) => setDurationMin(+e.target.value)}
+              className="w-full"
+            />
+            <div className="flex justify-between text-xs text-gray-500 mt-1">
+              <span>30min</span>
+              <span>1h30</span>
+              <span>3h</span>
+              <span>5h</span>
+            </div>
+          </div>
         </div>
       )}
 

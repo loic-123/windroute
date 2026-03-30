@@ -2,9 +2,11 @@
 Route generation endpoints with async job tracking.
 """
 
+import asyncio
 import logging
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
@@ -27,6 +29,9 @@ from app.output.map_data import route_to_geojson
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/routes", tags=["routes"])
+
+# Thread pool for CPU-heavy generation (doesn't block the event loop)
+_executor = ThreadPoolExecutor(max_workers=2)
 
 
 @router.post("/generate", response_model=GenerationJobResponse)
@@ -53,8 +58,11 @@ async def start_generation(
         "params": request.model_dump(),
     }).execute()
 
-    background_tasks.add_task(
-        _run_generation, job_id, request, athlete_data, db
+    # Run in a separate thread so OSMnx loading doesn't block the server
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(
+        _executor,
+        lambda: asyncio.run(_run_generation(job_id, request, athlete_data, db)),
     )
 
     return GenerationJobResponse(job_id=job_id, status="queued")
@@ -232,7 +240,9 @@ async def _run_generation(
         elif request.manual_workout:
             workout = _parse_manual_workout(request.manual_workout, athlete.ftp_watts)
         else:
-            raise ValueError("Either workout_id or manual_workout is required")
+            # No workout selected: generate a default endurance ride
+            duration_s = request.options.get("duration_seconds", 5400)  # default 1h30
+            workout = _build_default_endurance(athlete.ftp_watts, int(duration_s))
 
         # Get weather
         _update_job(db, job_id, "running", 20, "Récupération météo...")
@@ -432,6 +442,40 @@ def _parse_manual_workout(manual: dict, ftp: int) -> ParsedWorkout:
     )
 
     return ParsedWorkout(name="Manual Workout", blocks=blocks)
+
+
+def _build_default_endurance(ftp: int, total_duration_s: int = 5400) -> ParsedWorkout:
+    """Build a simple endurance ride: warmup + endurance + cooldown."""
+    warmup_s = min(900, total_duration_s // 6)
+    cooldown_s = min(600, total_duration_s // 6)
+    main_s = total_duration_s - warmup_s - cooldown_s
+
+    blocks = [
+        WorkoutBlock(
+            index=0,
+            block_type=BlockType.WARMUP,
+            duration_seconds=warmup_s,
+            power_watts=ftp * 0.55,
+            power_percent_ftp=55.0,
+        ),
+        WorkoutBlock(
+            index=1,
+            block_type=BlockType.INTERVAL,
+            duration_seconds=main_s,
+            power_watts=ftp * 0.65,
+            power_percent_ftp=65.0,
+        ),
+        WorkoutBlock(
+            index=2,
+            block_type=BlockType.COOLDOWN,
+            duration_seconds=cooldown_s,
+            power_watts=ftp * 0.50,
+            power_percent_ftp=50.0,
+        ),
+    ]
+
+    hours = total_duration_s / 3600
+    return ParsedWorkout(name=f"Endurance {hours:.1f}h", blocks=blocks)
 
 
 def _row_to_route_response(

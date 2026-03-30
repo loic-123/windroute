@@ -111,12 +111,14 @@ def load_or_fetch_graph(
 
 
 def enrich_elevations(graph: nx.MultiDiGraph) -> nx.MultiDiGraph:
-    """Add elevation data to graph nodes.
+    """Add elevation data to graph nodes using local SRTM data.
 
-    Tries open-elevation API via httpx, then falls back to setting
-    elevation=0 for all nodes (flat terrain approximation).
+    Uses the srtm.py package which auto-downloads SRTM tiles to
+    ~/.cache/srtm/ on first use. After that, lookups are instant.
+    No API calls, no rate limiting, works offline.
     """
-    # Check how many nodes already have elevation
+    import srtm
+
     nodes_with_ele = sum(
         1 for _, d in graph.nodes(data=True) if "elevation" in d
     )
@@ -126,52 +128,29 @@ def enrich_elevations(graph: nx.MultiDiGraph) -> nx.MultiDiGraph:
         logger.info("Graph already has elevation data (%d/%d nodes)", nodes_with_ele, total)
         return _add_edge_grades(graph)
 
-    logger.info("Enriching %d nodes with elevation data...", total - nodes_with_ele)
+    logger.info("Enriching %d nodes with SRTM elevation data...", total - nodes_with_ele)
 
     try:
-        graph = _fetch_elevations_open(graph)
+        srtm_data = srtm.get_data()
+        enriched = 0
+        for node, data in graph.nodes(data=True):
+            if "elevation" not in data:
+                lat = data.get("y", 0)
+                lon = data.get("x", 0)
+                ele = srtm_data.get_elevation(lat, lon)
+                data["elevation"] = ele if ele is not None else 0.0
+                if ele is not None:
+                    enriched += 1
+
+        logger.info("SRTM elevation: %d/%d nodes enriched", enriched, total)
+
     except Exception as e:
-        logger.warning(
-            "Failed to fetch elevations: %s. Using flat terrain (elevation=0).", e
-        )
+        logger.warning("SRTM elevation failed: %s. Using flat terrain.", e)
         for node in graph.nodes:
             if "elevation" not in graph.nodes[node]:
                 graph.nodes[node]["elevation"] = 0.0
 
     return _add_edge_grades(graph)
-
-
-def _fetch_elevations_open(graph: nx.MultiDiGraph) -> nx.MultiDiGraph:
-    """Fetch elevations from open-elevation.com API in batches."""
-    import httpx
-
-    nodes_need = [
-        (n, d["y"], d["x"])
-        for n, d in graph.nodes(data=True)
-        if "elevation" not in d
-    ]
-
-    batch_size = 200
-    for i in range(0, len(nodes_need), batch_size):
-        batch = nodes_need[i : i + batch_size]
-        locations = [{"latitude": lat, "longitude": lon} for _, lat, lon in batch]
-
-        try:
-            resp = httpx.post(
-                "https://api.open-elevation.com/api/v1/lookup",
-                json={"locations": locations},
-                timeout=30.0,
-            )
-            resp.raise_for_status()
-            results = resp.json().get("results", [])
-            for (node_id, _, _), result in zip(batch, results):
-                graph.nodes[node_id]["elevation"] = result.get("elevation", 0.0)
-        except Exception as e:
-            logger.warning("Open-elevation batch %d failed: %s", i, e)
-            for node_id, _, _ in batch:
-                graph.nodes[node_id]["elevation"] = 0.0
-
-    return graph
 
 
 def _add_edge_grades(graph: nx.MultiDiGraph) -> nx.MultiDiGraph:
